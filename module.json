@@ -1,0 +1,27 @@
+{
+  "id": "arton-de-bolso",
+  "title": "Arton de Bolso",
+  "description": "Dá aos jogadores de Tormenta20 uma ficha de celular que espelha o Foundry em tempo real, para mesas presenciais e híbridas. O módulo transforma o Foundry num relay: o client do mestre lê e escreve na ficha e retransmite por WebSocket para o front-end standalone (projeto arton-de-bolso-frontend, hospedado à parte). Nunca rola dados — os dados são rolados na mesa.",
+  "version": "0.4.0",
+  "socket": true,
+  "authors": [
+    {
+      "name": "Arthur Santos"
+    }
+  ],
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "tormenta20",
+        "type": "system"
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/main.mjs"
+  ]
+}
