@@ -2,7 +2,7 @@
   "id": "arton-de-bolso",
   "title": "Arton de Bolso",
   "description": "Metade Foundry do Arton de Bolso: uma ficha de Tormenta20 para o celular, feita para mesas presenciais e híbridas. O módulo transforma o Foundry num relay — o client do mestre lê e escreve na ficha e retransmite em tempo real por WebSocket. SOZINHO ELE NÃO FAZ NADA VISÍVEL: não tem interface dentro do Foundry e precisa do front-end arton-de-bolso-frontend, hospedado à parte, que é onde os jogadores abrem a ficha. Nunca rola dados — os dados são rolados na mesa.",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "socket": true,
   "authors": [
     {
@@ -30,5 +30,5 @@
   "bugs": "https://github.com/santos-arthur/arton-de-bolso/issues",
   "changelog": "https://github.com/santos-arthur/arton-de-bolso/releases",
   "manifest": "https://github.com/santos-arthur/arton-de-bolso/releases/latest/download/module.json",
-  "download": "https://github.com/santos-arthur/arton-de-bolso/releases/download/v0.4.0/module.zip"
+  "download": "https://github.com/santos-arthur/arton-de-bolso/releases/download/v1.0.0/module.zip"
 }

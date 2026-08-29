@@ -67,10 +67,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
-            module.json module.zip \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          # Idempotente de propósito: a primeira versão sai antes de o pacote
+          # existir no foundryvtt.com, e é normal re-rodar este workflow depois
+          # de criar o segredo do token. Sem isto, a re-execução morreria aqui
+          # com "release already exists" e nunca chegaria ao passo do registro.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "A release $GITHUB_REF_NAME já existe — atualizando os arquivos."
+            gh release upload "$GITHUB_REF_NAME" module.json module.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              module.json module.zip \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
 
       - name: Registrar a versão no foundryvtt.com
         env:
