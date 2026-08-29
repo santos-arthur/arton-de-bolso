@@ -1,0 +1,118 @@
+# Publica uma versão do módulo.
+#
+# Dispara ao empurrar uma tag `vX.Y.Z`. A tag é a fonte da verdade da versão:
+# ela carimba o `module.json` do pacote, monta o zip, cria a release no GitHub
+# e — se o segredo existir — registra a versão no foundryvtt.com.
+#
+#   git tag v0.4.1 && git push origin v0.4.1
+#
+# Para o registro no site funcionar, crie o segredo FOUNDRY_PACKAGE_TOKEN no
+# repositório (Settings → Secrets and variables → Actions) com o valor do campo
+# "Package Release Token", que fica na página do pacote no foundryvtt.com. Sem
+# ele, o passo é pulado e a release do GitHub sai do mesmo jeito.
+#
+# Primeira vez? Crie a variável de repositório FOUNDRY_DRY_RUN=true (Settings →
+# Secrets and variables → Actions → Variables). A API valida tudo — versão,
+# compatibilidade, URLs — e não grava nada. Confirmado que passa, apague a
+# variável e repita a tag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ler a versão da tag
+        id: versao
+        run: echo "numero=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Carimbar o module.json
+        env:
+          VERSAO: ${{ steps.versao.outputs.numero }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # `manifest` continua apontando para o "latest" — é a URL fixa que o
+          # Foundry consulta para descobrir que saiu versão nova. Só `download`
+          # é preso a esta tag, para quem instala a 0.4.0 receber a 0.4.0.
+          jq --arg versao "$VERSAO" \
+             --arg download "$REPO_URL/releases/download/$GITHUB_REF_NAME/module.zip" \
+             '.version = $versao | .download = $download' \
+             module.json > module.json.novo
+          mv module.json.novo module.json
+          cat module.json
+
+      - name: Montar o zip
+        run: |
+          set -euo pipefail
+          # O module.json precisa ficar na RAIZ do zip — o Foundry não procura
+          # dentro de subpasta. E entra só o que é o módulo: as ferramentas
+          # locais de desenvolvimento não estão no repositório.
+          zip -r module.zip module.json scripts README.md LICENSE
+          unzip -l module.zip
+
+      - name: Criar a release no GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            module.json module.zip \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+      - name: Registrar a versão no foundryvtt.com
+        env:
+          TOKEN: ${{ secrets.FOUNDRY_PACKAGE_TOKEN }}
+          VERSAO: ${{ steps.versao.outputs.numero }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          ENSAIO: ${{ vars.FOUNDRY_DRY_RUN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "Sem FOUNDRY_PACKAGE_TOKEN: pulando o registro no foundryvtt.com."
+            echo "A release do GitHub já está publicada; dá para registrar à mão na página do pacote."
+            exit 0
+          fi
+
+          # Aqui o `manifest` aponta para ESTA release, e não para o "latest" —
+          # é o contrário do campo homônimo dentro do module.json, e a própria
+          # documentação da API insiste nesse ponto.
+          # Só o literal "true" liga o ensaio; qualquer outra coisa (ou nada)
+          # publica de verdade.
+          [ "${ENSAIO:-}" = "true" ] && ensaio=true || ensaio=false
+          echo "dry-run: $ensaio"
+
+          corpo=$(jq -n \
+            --argjson ensaio "$ensaio" \
+            --arg id "$(jq -r .id module.json)" \
+            --arg versao "$VERSAO" \
+            --arg manifest "$REPO_URL/releases/download/$GITHUB_REF_NAME/module.json" \
+            --arg notas "$REPO_URL/releases/tag/$GITHUB_REF_NAME" \
+            --argjson compat "$(jq -c .compatibility module.json)" \
+            '{id: $id, "dry-run": $ensaio, release: {version: $versao, manifest: $manifest, notes: $notas, compatibility: $compat}}')
+
+          echo "Enviando: $corpo"
+          resposta=$(mktemp)
+          codigo=$(curl -sS -o "$resposta" -w "%{http_code}" \
+            -X POST https://foundryvtt.com/_api/packages/release_version/ \
+            -H "Content-Type: application/json" \
+            -H "Authorization: $TOKEN" \
+            -d "$corpo")
+
+          cat "$resposta"; echo
+          if [ "$codigo" -ge 300 ]; then
+            echo "::error::O foundryvtt.com recusou o registro (HTTP $codigo)."
+            exit 1
+          fi

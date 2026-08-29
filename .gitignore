@@ -1,0 +1,5 @@
+# Ferramentas locais de desenvolvimento, que não fazem parte do módulo.
+# O deploy.sh copia esta pasta para dentro da instalação do Foundry e depende
+# de caminhos da máquina de quem o usa.
+deploy.sh
+.foundry-data
