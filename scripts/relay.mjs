@@ -34,12 +34,15 @@
  *     { tipo: "salvarPaginaDiario", paginaId, titulo, conteudo }
  *     { tipo: "excluirPaginaDiario", paginaId }
  *     { tipo: "obterCompendio" }
+ *     { tipo: "obterCombate" }
+ *     { tipo: "definirIniciativa", d20, aprimoramentos: [{ id, vezes }] }
  *   Foundry → Front (sempre só para o userId a quem a mensagem diz respeito):
  *     { tipo: "personagens", meus: [...], companheiros: [...] }
  *     { tipo: "ficha", ficha: <getFichaCompleta + somenteLeitura> }
  *     { tipo: "semFicha" }
  *     { tipo: "diarios", diarios: [{ id, nome, meu, paginas: [...] }] }
  *     { tipo: "compendio", compendio: { pastas: [...], journals: [{ id, nome, paginas: [...] }] } }
+ *     { tipo: "combate", combate: { ativo, rodada, comecou, combatentes: [...] } }
  *     { tipo: "erro", mensagem }
  *
  * Autorização: cada mensagem chega com o userId de quem enviou, verificado
@@ -62,6 +65,8 @@ import { MODULE_ID } from "./constantes.mjs";
 import * as adaptador from "./adaptador-tormenta20.mjs";
 import * as diarios from "./diarios.mjs";
 import * as compendio from "./compendio.mjs";
+import * as combate from "./combate.mjs";
+import { MODULE_ID as ID_DO_MODULO } from "./constantes.mjs";
 
 const EVENTO = `module.${MODULE_ID}`;
 
@@ -95,7 +100,9 @@ const TIPOS_DO_FRONT = new Set([
   "criarPaginaDiario",
   "salvarPaginaDiario",
   "excluirPaginaDiario",
-  "obterCompendio"
+  "obterCompendio",
+  "obterCombate",
+  "definirIniciativa"
 ]);
 
 /**
@@ -124,7 +131,10 @@ const TIPOS_ESCRITA = new Set([
   "ajustarDinheiro",
   "descansar",
   "gastarUso",
-  "removerEfeito"
+  "removerEfeito",
+  // Escreve no combatente, não no ator — mas quem manda na iniciativa de um
+  // personagem é quem manda no personagem.
+  "definirIniciativa"
 ]);
 
 function warn(mensagem) {
@@ -223,6 +233,7 @@ const ultimaListaEnviada = new Map();
 const ultimaFichaEnviada = new Map();
 const ultimosDiariosEnviados = new Map();
 const ultimoCompendioEnviado = new Map();
+const ultimoCombateEnviado = new Map();
 
 /**
  * Quem já pediu os diários alguma vez — e portanto tem a tela de anotações
@@ -235,6 +246,14 @@ let diariosSujos = false;
 /** Mesma ideia para o compêndio — quem abriu a tela dele. */
 const interessadosEmCompendio = new Set();
 let compendioSujo = false;
+
+/**
+ * E para o combate. Aqui a inscrição importa mais que nas outras: a ordem de
+ * combate muda a cada turno, e uma mesa em luta geraria um push por passagem
+ * de turno para o mundo inteiro se não fosse só para quem abriu a tela.
+ */
+const interessadosEmCombate = new Set();
+let combateSujo = false;
 
 function agendarPassagem() {
   if (passagemAgendada) return;
@@ -285,6 +304,12 @@ function marcarDiarios() {
 function marcarCompendio() {
   if (!interessadosEmCompendio.size) return;
   compendioSujo = true;
+  agendarPassagem();
+}
+
+function marcarCombate() {
+  if (!interessadosEmCombate.size) return;
+  combateSujo = true;
   agendarPassagem();
 }
 
@@ -353,6 +378,19 @@ function enviarCompendio(user, forcar = false) {
   enviar(user.id, { tipo: "compendio", compendio: lista });
 }
 
+/**
+ * O combate é o mesmo para todo mundo — rodada, ordem e turno não mudam com
+ * quem olha —, então a lista é montada uma vez por passada e só o filtro de
+ * "já mandei isto" é por usuário. Quem esconde o próprio PV/PM na linha da
+ * ficha aberta é a tela, que sabe qual ficha está aberta.
+ */
+function enviarCombate(user, lista, forcar = false) {
+  const serializada = JSON.stringify(lista);
+  if (!forcar && ultimoCombateEnviado.get(user.id) === serializada) return;
+  ultimoCombateEnviado.set(user.id, serializada);
+  enviar(user.id, { tipo: "combate", combate: lista });
+}
+
 /** Resposta a um pedido explícito do front: manda tudo, mesmo que nada tenha mudado. */
 function enviarEstado(user) {
   enviarLista(user, true);
@@ -369,11 +407,13 @@ function processarPendencias() {
   const recalcularListas = listasSujas;
   const recalcularDiarios = diariosSujos;
   const recalcularCompendio = compendioSujo;
+  const recalcularCombate = combateSujo;
   atoresPendentes.clear();
   usuariosPendentes.clear();
   listasSujas = false;
   diariosSujos = false;
   compendioSujo = false;
+  combateSujo = false;
 
   const todos = [...game.users];
 
@@ -388,6 +428,14 @@ function processarPendencias() {
     for (const userId of interessadosEmCompendio) {
       const user = game.users.get(userId);
       if (user) enviarCompendio(user);
+    }
+  }
+
+  if (recalcularCombate) {
+    const lista = combate.listarCombate();
+    for (const userId of interessadosEmCombate) {
+      const user = game.users.get(userId);
+      if (user) enviarCombate(user, lista);
     }
   }
 
@@ -526,6 +574,13 @@ async function tratarMensagem(mensagem, senderUserId) {
     return;
   }
 
+  if (tipo === "obterCombate") {
+    // Idem: quem abriu a tela de combate passa a receber cada virada de turno.
+    interessadosEmCombate.add(user.id);
+    enviarCombate(user, combate.listarCombate(), true);
+    return;
+  }
+
   if (TIPOS_DE_DIARIO.has(tipo)) {
     await tratarDiario(tipo, mensagem, user);
     return;
@@ -608,6 +663,13 @@ async function tratarMensagem(mensagem, senderUserId) {
         await adaptador.removerEfeito(actor, mensagem.efeitoId);
         break;
       }
+      case "definirIniciativa": {
+        await combate.definirIniciativa(actor, {
+          d20: mensagem.d20,
+          aprimoramentos: mensagem.aprimoramentos
+        });
+        break;
+      }
       default:
         warn(`Mensagem com tipo desconhecido ignorada: "${tipo}"`);
     }
@@ -654,6 +716,23 @@ export function registrarRelay() {
 
   Hooks.on("createActor", () => marcarListas());
   Hooks.on("deleteActor", () => marcarListas());
+
+  // ---- Combate ---------------------------------------------------------------
+  // Tudo que mexe no encontro: começar, passar o turno, entrar na ordem,
+  // rolar iniciativa, sair da luta. `updateCombat` cobre rodada e turno;
+  // os de Combatant, a ordem e a iniciativa.
+  for (const evento of ["createCombat", "updateCombat", "deleteCombat"]) {
+    Hooks.on(evento, () => marcarCombate());
+  }
+  for (const evento of ["createCombatant", "updateCombatant", "deleteCombatant"]) {
+    Hooks.on(evento, () => marcarCombate());
+  }
+  // A lista carrega o PV/PM dos aliados e a barra dos inimigos, então o dano
+  // que o mestre aplica na mesa precisa chegar nela — e isso é `updateActor`.
+  // `marcarCombate` só faz algo se alguém estiver com a tela aberta.
+  Hooks.on("updateActor", () => marcarCombate());
+  // O mestre ligou ou desligou a barra de vida dos inimigos.
+  Hooks.on(`${ID_DO_MODULO}.configuracaoMudou`, () => marcarCombate());
 
   // Só a troca do personagem atribuído muda o que o usuário vê — updateUser
   // dispara por muita coisa irrelevante (cor, flags, avatar).

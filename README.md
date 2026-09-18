@@ -82,6 +82,13 @@ durante o jogo — se fechar, os celulares param de receber.
   dos jogadores e do compêndio. São os únicos que falam com
   `JournalEntry`/`Folder`.
 
+- **`scripts/combate.mjs`** lê o encontro em andamento (rodada, ordem, turno,
+  iniciativa) e grava a iniciativa que o jogador rolou na mesa. É o único que
+  fala com `Combat`/`Combatant`.
+
+- **`scripts/configuracoes.mjs`** registra as opções do módulo na tela de
+  Configurar Módulos do Foundry.
+
 - **`scripts/html-seguro.mjs`** reduz o HTML que entra e sai a uma allowlist de
   tags e atributos.
 
@@ -209,6 +216,42 @@ A pasta é procurada **ignorando acentos e caixa**: uma versão anterior do mód
 a criou como "Conteudos Para Jogadores", e achar as duas grafias evita o mundo
 terminar com duas pastas quase iguais (a antiga é renomeada para a forma com
 acento).
+
+---
+
+## Combate
+
+Com um encontro ativo no Foundry, a aba de Combate do app ganha no topo a
+rodada, de quem é o turno (com a iniciativa que ele tirou), quem vem depois e
+a ordem inteira. Tudo isso se mexe sozinho: virar o turno no computador do
+mestre chega ao celular no mesmo instante.
+
+**A iniciativa é rolada na mesa, como todo o resto.** O botão de d20 abre o
+mesmo painel de um teste de perícia — de onde vem o modificador, o que dá
+para gastar em PM para melhorá-lo — mais um campo para o resultado do dado.
+Salvar cobra o que foi marcado (com o aviso no chat) e grava a iniciativa no
+encontro, sem ninguém precisar ir até o computador do mestre. Dá para salvar
+de novo: erro de digitação e rerrolagem acontecem.
+
+O que cada um enxerga da ordem:
+
+| | O que aparece |
+|---|---|
+| **Aliado** (personagem de jogador ou token amigável) | Nome, iniciativa, PV e PM com números |
+| **Inimigo** | Nome e iniciativa; barra de vida sem números **só se o mestre ligar a opção** |
+| **A ficha que você está vendo** | Sem PV/PM na lista — eles já estão no cabeçalho, acima |
+| **Combatente escondido pelo mestre** (`hidden`) | Nada: não sai do Foundry |
+
+### Opção do módulo
+
+Em **Configurações → Gerenciar Módulos → Arton de Bolso**:
+
+| Opção | Padrão | O que faz |
+|---|---|---|
+| **Mostrar Barras de Vida de Inimigos no Combate?** | Desligada | Ligada, o inimigo mostra quanto lhe resta de vida em proporção (nunca o número). Desligada, só nome e iniciativa. |
+
+É opção de mundo: quem decide é o mestre, e vale para a mesa inteira. Mudá-la
+atualiza as telas abertas na hora.
 
 ---
 
