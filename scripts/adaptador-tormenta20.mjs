@@ -105,8 +105,48 @@ function avaliarFormula(valorBruto, rollData) {
   }
 }
 
+/**
+ * Válido só durante uma montagem de ficha (ver `getFichaCompleta`), que é
+ * síncrona: nada muda no ator entre a primeira e a última leitura. Fora dali
+ * fica vazio, e cada consulta remonta o mapa — que é o que o getter do
+ * sistema fazia a cada acesso de qualquer forma.
+ */
+const cacheDeModificadores = new WeakMap();
+
+/**
+ * As mudanças de todos os efeitos ativos, agrupadas por chave — o mesmo que o
+ * `actor.modifiedFields` do sistema devolve, montado aqui.
+ *
+ * Não é duplicação por gosto: o getter do sistema tem a linha
+ * `if ([3, 4].includes(ch.value)) continue;`, que descarta qualquer mudança
+ * cujo **valor** seja 3 ou 4 (a intenção era claramente filtrar os antigos
+ * `mode` 3 e 4). Isso era inofensivo enquanto os valores eram texto — `"3"`
+ * não é `3` —, mas o Foundry v14 converte o que parece número ao migrar o
+ * efeito, e de repente todo bônus de +3 ou +4 sumiu do tooltip da ficha e,
+ * por tabela, da decomposição que o app mostra. Bônus de +3/+4 em atributo
+ * são dos mais comuns no jogo.
+ *
+ * Enquanto o sistema não corrigir, montamos a lista aqui — mesmo critério
+ * (`appliedEffects` + `modifiesActor`), sem o filtro.
+ */
+function modificadoresPorChave(actor) {
+  const doCache = cacheDeModificadores.get(actor);
+  if (doCache) return doCache;
+
+  const mapa = {};
+  for (const efeito of actor.appliedEffects ?? []) {
+    if (!efeito.modifiesActor) continue;
+    for (const mudanca of mudancasDoEfeito(efeito)) {
+      const chave = mudanca?.key;
+      if (!chave) continue;
+      (mapa[chave] ??= []).push({ label: efeito.name, value: mudanca.value, type: mudanca.type });
+    }
+  }
+  return mapa;
+}
+
 function getModificadoresNomeados(actor, chave, rollData = actor.getRollData()) {
-  const lista = actor.modifiedFields?.[chave];
+  const lista = modificadoresPorChave(actor)[chave];
   if (!lista) return [];
   return lista
     .filter((m) => m.type === TIPO_MUDANCA_SOMA)
@@ -473,7 +513,34 @@ export function getMovimento(actor) {
   return { valor, unidade, itens };
 }
 
-/** Atributo (FOR/DES/...) com a decomposição base/racial/bônus para o popover de detalhe. */
+/**
+ * Onde um Active Effect de atributo pode pousar. São quatro porque o sistema
+ * aceita escrever de quatro formas, e `modifiedFields` guarda a chave como o
+ * efeito a escreveu:
+ *
+ *   - `.value`, que soma no total já pronto;
+ *   - `.bonus`, o mesmo campo do "Bônus Temporário" digitado na ficha;
+ *   - as duas com `*` no lugar do atributo — é como se escreve "+1 em todos
+ *     os atributos" (ver a lista de curingas em `_prepareProxyChange`, no
+ *     sistema).
+ *
+ * Mesma ideia de `CHAVES_EFEITO_DESLOCAMENTO`, logo acima.
+ */
+function chavesDeEfeitoDoAtributo(chave, campo) {
+  return [`system.atributos.${chave}.${campo}`, `system.atributos.*.${campo}`];
+}
+
+/**
+ * Atributo (FOR/DES/...) decomposto para o popover de detalhe, na mesma ordem
+ * que o tooltip da ficha do sistema usa (ver o helper `fieldBonuses`):
+ *
+ *   Valor Base · Racial · Bônus Temporário · efeitos
+ *
+ * A lista fecha com um "Outros efeitos" reconciliando o que sobrar contra o
+ * `value` real — como Defesa, perícia e PV/PM já faziam. Sem ele, um efeito
+ * que o sistema aplicasse por um caminho não previsto aqui sumia da conta em
+ * silêncio, e a soma das linhas não batia com o número mostrado ao lado.
+ */
 export function getAtributo(actor, chave) {
   const dado = actor.system?.atributos?.[chave];
   if (!dado) {
@@ -481,15 +548,31 @@ export function getAtributo(actor, chave) {
     return { mod: null, itens: [] };
   }
 
+  const rollData = actor.getRollData();
   const itens = [{ rotulo: "Valor Base", valor: dado.base ?? 0 }];
   if (dado.racial) itens.push({ rotulo: "Racial", valor: dado.racial });
 
-  if (dado.bonus) {
-    const nomeados = getModificadoresNomeados(actor, `system.atributos.${chave}.value`);
-    itens.push(...nomeados);
-    const residual = dado.bonus - nomeados.reduce((soma, item) => soma + item.valor, 0);
-    if (residual) itens.push({ rotulo: "Bônus", valor: residual });
-  }
+  // As duas consultas são separadas porque os destinos se comportam
+  // diferente: o que cai em `.bonus` já está dentro do campo `bonus`, e o que
+  // cai em `.value` só aparece no total.
+  const noBonus = chavesDeEfeitoDoAtributo(chave, "bonus").flatMap((caminho) =>
+    getModificadoresNomeados(actor, caminho, rollData)
+  );
+  const noValor = chavesDeEfeitoDoAtributo(chave, "value").flatMap((caminho) =>
+    getModificadoresNomeados(actor, caminho, rollData)
+  );
+
+  // O campo `bonus` carrega duas coisas ao mesmo tempo: o número que o
+  // jogador digita na ficha e o que os efeitos somaram nele. Descontando os
+  // efeitos, o que sobra é o que foi digitado.
+  const manual = (dado.bonus ?? 0) - noBonus.reduce((soma, m) => soma + m.valor, 0);
+  if (manual) itens.push({ rotulo: "Bônus Temporário", valor: manual });
+
+  itens.push(...noBonus, ...noValor);
+
+  const total = dado.value ?? 0;
+  const residual = total - itens.reduce((soma, item) => soma + item.valor, 0);
+  if (residual) itens.push({ rotulo: "Outros efeitos", valor: residual });
 
   return { mod: dado.value ?? null, itens };
 }
@@ -660,7 +743,11 @@ export function getFormulaPericia(actor, chave) {
     ...(ehResistencia ? getModificadoresNomeados(actor, "system.modificadores.pericias.resistencia", rollData) : []),
     ...(!ehAtaque ? getModificadoresNomeados(actor, "system.modificadores.pericias.semataque", rollData) : []),
     ...getModificadoresNomeados(actor, `system.modificadores.pericias.atr.${atributoChave}`, rollData),
-    ...getModificadoresNomeados(actor, `system.pericias.${chave}.bonus`, rollData)
+    ...getModificadoresNomeados(actor, `system.pericias.${chave}.bonus`, rollData),
+    // "+1 em todas as perícias" é escrito com `*` (mesmos curingas do
+    // atributo); sem esta linha o bônus existia no total e chegava à tela
+    // como um "Outros efeitos" sem nome.
+    ...getModificadoresNomeados(actor, "system.pericias.*.bonus", rollData)
   ];
 
   // `actor.getRollData()` inclui "@meionivel" (metade do nível, sempre) em
@@ -2653,6 +2740,17 @@ export function getProtecoes(actor) {
 // ---------------------------------------------------------------------------
 
 export function getFichaCompleta(actor) {
+  // Uma passada só pelos efeitos para a ficha inteira: sem isto, cada perícia
+  // faz seis consultas e cada uma revarreria todos os efeitos do ator.
+  cacheDeModificadores.set(actor, modificadoresPorChave(actor));
+  try {
+    return montarFichaCompleta(actor);
+  } finally {
+    cacheDeModificadores.delete(actor);
+  }
+}
+
+function montarFichaCompleta(actor) {
   const pvData = getPV(actor);
   const pmData = getPM(actor);
   const defesaData = getDefesa(actor);
