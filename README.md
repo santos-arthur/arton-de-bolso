@@ -216,8 +216,8 @@ acento).
 
 | | |
 |---|---|
-| Foundry VTT | versão 13 |
-| Sistema | `tormenta20` |
+| Foundry VTT | versão 14 |
+| Sistema | `tormenta20` 1.6.0 ou mais novo |
 | O par | o front-end `arton-de-bolso-frontend`, hospedado à parte |
 | Durante o jogo | o Foundry do **mestre** aberto — é o client dele que roda o relay |
 

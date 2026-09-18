@@ -3,8 +3,8 @@
  *
  * ÚNICO arquivo que conhece os caminhos de `actor.system.*` / `item.system.*`.
  * Os caminhos abaixo foram confirmados lendo o código-fonte do sistema
- * instalado (`tormenta20.mjs`, versão 1.5.015) — os data models
- * (`CharacterData`, `SkillData`, `WeaponData`, `EquipmentData`, `PowerData`,
+ * instalado (`tormenta20.mjs`, versão 1.6.2 — a primeira para o Foundry v14)
+ * — os data models (`CharacterData`, `WeaponData`, `EquipmentData`, `PowerData`,
  * `SpellData`, `ClassData`, etc.) e as funções `prepareSkill`/`prepareDefense`/
  * a lista de efeitos usada no tooltip de PV/PM/Defesa da própria ficha do
  * sistema — não apenas inspecionando um personagem ao vivo. Ver
@@ -13,6 +13,27 @@
  * Nota: `atributos` (FOR/DES/CON/INT/SAB/CAR) e `attributes` (PV/PM/defesa/
  * movimento/nível) são dois campos top-level distintos no sistema — fácil de
  * confundir.
+ *
+ * Foundry v14 / Tormenta20 1.6
+ * ----------------------------
+ * A virada do sistema para a v14 mexeu em tudo que este arquivo lê sobre
+ * Active Effects, e é de propósito que não há caminho de compatibilidade com
+ * a geração anterior: o T20 1.6 exige o Foundry 14 e o 1.5 recusa rodar nele
+ * (`maximum: 13`), então nunca existe um mundo em que os dois formatos
+ * convivam. O que mudou, e onde:
+ *
+ *   - `effect.changes` virou `effect.system.changes`, e o `mode` numérico de
+ *     cada mudança virou um `type` em texto (`CONST.ACTIVE_EFFECT_CHANGE_TYPES`);
+ *   - as propriedades que o sistema guardava em `flags.tormenta20` do efeito
+ *     ("de uso", custo, escopos, itens) passaram a campos próprios em
+ *     `effect.system.onuse` / `effect.system.abilityUse`;
+ *   - `duration` deixou de ter `rounds`/`turns` separados: agora é
+ *     `{ value, units, expiry }`, com eventos de expiração (fim de cena,
+ *     efeito sustentado) no lugar dos truques de contagem alta;
+ *   - `CONFIG.statusEffects` deixou de ser uma lista e passou a ser indexado
+ *     pelo id da condição;
+ *   - `system.rolltags` (e as outras listas de tags do item) viraram `Set`,
+ *     que não tem `.some`/`.filter` — só iteração.
  */
 
 import { MODULE_ID } from "./constantes.mjs";
@@ -43,8 +64,8 @@ function formatarBonus(valor) {
 // ---------------------------------------------------------------------------
 // Bônus nomeados (Active Effects) — mesma fonte que a própria ficha do
 // sistema usa pra montar o tooltip de cada campo: `actor.modifiedFields`
-// (getter em tormenta20.mjs, `get modifiedFields()`), que agrupa as mudanças
-// de todos os Active Effects do ator por `key` — ex:
+// (getter em tormenta20.mjs, `get modifiedFields()`), que agrupa por `key` as
+// mudanças dos Active Effects aplicados ao ator — ex:
 // "system.attributes.defesa.bonus", "system.pericias.furt.bonus". Os
 // caminhos exatos foram confirmados lendo onde a própria ficha chama
 // `fieldBonuses` nos templates .hbs do sistema. Preferimos isso a cair num
@@ -52,7 +73,13 @@ function formatarBonus(valor) {
 // — o que sobrar sem nome vira mesmo um "Outros" no final de cada função.
 // ---------------------------------------------------------------------------
 
-const ACTIVE_EFFECT_MODE_ADD = 2;
+/**
+ * Só as mudanças que **somam** entram na decomposição: uma que substitui ou
+ * multiplica não é uma parcela do total. No v14 o campo virou texto
+ * (`CONST.ACTIVE_EFFECT_CHANGE_TYPES.ADD`); o literal evita depender da ordem
+ * em que o core popula o `CONST`.
+ */
+const TIPO_MUDANCA_SOMA = "add";
 
 /**
  * O valor de um Active Effect raramente é um número cru — costuma ser uma
@@ -82,7 +109,7 @@ function getModificadoresNomeados(actor, chave, rollData = actor.getRollData()) 
   const lista = actor.modifiedFields?.[chave];
   if (!lista) return [];
   return lista
-    .filter((m) => m.mode === ACTIVE_EFFECT_MODE_ADD)
+    .filter((m) => m.type === TIPO_MUDANCA_SOMA)
     .map((m) => ({ rotulo: m.label, valor: avaliarFormula(m.value, rollData) }))
     // Descarta o que não avaliou e o que deu zero (efeito inativo no momento):
     // um "Fulano +0" na lista é só ruído pro jogador.
@@ -503,12 +530,19 @@ export function getResistencias(actor) {
   return resultado;
 }
 
-/** Imunidade a condições (`system.tracos.ic`) — nomes vêm de `CONFIG.statusEffects` (T20Conditions). */
+/**
+ * Imunidade a condições (`system.tracos.ic`) — os nomes vêm de
+ * `CONFIG.statusEffects`, que no v14 é indexado pelo id da condição (o
+ * sistema o remonta a partir do compêndio "Condições" que ele cria no mundo).
+ */
 export function getImunidadesCondicoes(actor) {
   const ic = actor.system?.tracos?.ic;
   const ids = [...(ic?.value ?? [])];
-  const status = CONFIG?.statusEffects ?? [];
-  const resultado = ids.map((id) => status.find((s) => s.id === id)?.name ?? id);
+  const status = CONFIG?.statusEffects ?? {};
+  const resultado = ids.map((id) => {
+    const nome = status[id]?.name;
+    return nome ? t20Localize(nome, nome) : id;
+  });
   if (ic?.custom) resultado.push(ic.custom);
   return resultado;
 }
@@ -769,19 +803,24 @@ function normalizarNome(texto) {
 /**
  * A magia da ficha que este pergaminho contém — quem a tem, dispensa o teste.
  *
- * Duas pistas, nessa ordem: o `flags.core.sourceId` que o sistema grava ao
- * escrever o pergaminho (aponta para a magia de origem, e as magias da ficha
- * carregam o mesmo id quando vieram do mesmo compêndio) e, na falta dele, o
- * nome — "Pergaminho de Bola de Fogo" termina com o nome da magia. Termina,
- * não contém: senão "Luz" casaria com "Pergaminho de Luz das Estrelas".
+ * Duas pistas, nessa ordem: o `_stats.compendiumSource` que o Foundry grava
+ * ao escrever o pergaminho (aponta para a magia de origem, e as magias da
+ * ficha carregam o mesmo endereço quando vieram do mesmo compêndio) e, na
+ * falta dele, o nome — "Pergaminho de Bola de Fogo" termina com o nome da
+ * magia. Termina, não contém: senão "Luz" casaria com "Pergaminho de Luz das
+ * Estrelas".
  */
+function origemDeCompendio(documento) {
+  return documento?._stats?.compendiumSource ?? null;
+}
+
 function magiaConhecida(actor, item) {
   const magias = actor.items?.filter?.((i) => i.type === "magia") ?? [];
   if (!magias.length) return null;
 
-  const origem = item.flags?.core?.sourceId;
+  const origem = origemDeCompendio(item);
   if (origem) {
-    const porOrigem = magias.find((m) => m.uuid === origem || m.flags?.core?.sourceId === origem);
+    const porOrigem = magias.find((m) => m.uuid === origem || origemDeCompendio(m) === origem);
     if (porOrigem) return porOrigem;
   }
 
@@ -1096,8 +1135,16 @@ function labelAtivacao(item) {
  */
 const TAG_ATIVO = "ativo";
 
+/**
+ * As tags do item são `Set` desde o T20 1.6 — `Set` não tem `.some` nem
+ * `.filter`, só iteração, então tudo que as percorre passa por aqui.
+ */
+function tagsDeRolagem(item) {
+  return [...(item.system?.rolltags ?? [])];
+}
+
 function ehAtivavel(item) {
-  return (item.system?.rolltags ?? []).some((tag) => String(tag).trim().toLowerCase() === TAG_ATIVO);
+  return tagsDeRolagem(item).some((tag) => String(tag).trim().toLowerCase() === TAG_ATIVO);
 }
 
 /**
@@ -1106,7 +1153,7 @@ function ehAtivavel(item) {
  * origem ou divindade, e não de subir de nível.
  */
 function nivelDoPoder(item) {
-  for (const tag of item.system?.rolltags ?? []) {
+  for (const tag of tagsDeRolagem(item)) {
     const achado = /^lvl-(\d+)$/i.exec(String(tag).trim());
     if (achado) return Number(achado[1]);
   }
@@ -1518,6 +1565,31 @@ function nomesDeAprimoramentos(actor, ids) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Onde o Foundry v14 e o T20 1.6 puseram as partes de um Active Effect, num
+ * lugar só — o resto do arquivo pergunta aqui em vez de repetir os caminhos.
+ *
+ * As mudanças desceram de `effect.changes` para `effect.system.changes`, e o
+ * que o sistema guardava em `flags.tormenta20` (efeito "de uso", custo em PM,
+ * escopos, nomes de item) virou campo de `effect.system`.
+ */
+function mudancasDoEfeito(efeito) {
+  return efeito?.system?.changes ?? [];
+}
+
+/**
+ * Efeito "de uso": a opção que se marca ao conjurar ou ativar algo, não um
+ * bônus que está ligado na ficha.
+ */
+function ehEfeitoDeUso(efeito) {
+  return !!efeito?.system?.onuse;
+}
+
+/** A configuração de uso de um efeito: custo, escopos, restrição por nome. */
+function dadosDeUso(efeito) {
+  return efeito?.system?.abilityUse ?? {};
+}
+
+/**
  * O nome do campo segundo o **próprio sistema**: cada campo do schema de
  * personagem declara um `label`, e é dele que sai "Bônus de Defesa por Efeitos
  * Aplicados" para `system.modificadores.defesa`. Perguntar ao schema cobre os
@@ -1623,22 +1695,24 @@ function valorDaMudanca(valorBruto, rollData) {
   }
 }
 
-/** Como o Active Effect aplica o valor — o `mode` do Foundry, em uma palavra. */
-function modoDaMudanca(modo) {
-  switch (Number(modo)) {
-    case 1:
-      return "multiplica";
-    case 3:
-      return "no mínimo";
-    case 4:
-      return "no máximo";
-    case 5:
-      return "vira";
-    // 0 (custom) e 2 (soma) chegam aqui: somar é o caso comum, e um custom do
-    // sistema também acaba somando na prática.
-    default:
-      return "soma";
-  }
+/**
+ * Como o Active Effect aplica o valor — o `type` do Foundry v14, em uma
+ * palavra. "downgrade" e "upgrade" são teto e piso, nessa ordem: o primeiro
+ * só baixa o valor, o segundo só o levanta (a versão anterior deste módulo
+ * lia os dois trocados, herdando a inversão dos códigos 3 e 4).
+ */
+const PALAVRA_DO_TIPO = {
+  multiply: "multiplica",
+  downgrade: "no máximo",
+  upgrade: "no mínimo",
+  override: "vira",
+  subtract: "subtrai"
+};
+
+function modoDaMudanca(tipo) {
+  // "add" e "custom" caem no padrão: somar é o caso comum, e um custom do
+  // sistema também acaba somando na prática.
+  return PALAVRA_DO_TIPO[String(tipo ?? "")] ?? "soma";
 }
 
 /**
@@ -1646,15 +1720,20 @@ function modoDaMudanca(modo) {
  * desconta o que passou — reaproveitar é o que faz o app mostrar o mesmo que o
  * mestre vê na ficha.
  *
- * Quem decide se há prazo são os campos, não o rótulo: sem duração o Foundry
- * devolve um texto traduzido ("Nenhum" em português), e um efeito permanente
- * ganhava uma etiqueta "Nenhum" na tela.
+ * Quem decide se há prazo é o `isTemporary` do próprio efeito, não o rótulo:
+ * sem duração o Foundry devolve um texto traduzido ("Nenhum" em português), e
+ * um efeito permanente ganhava uma etiqueta "Nenhum" na tela. No v14 um
+ * efeito também pode ter prazo sem contagem — acaba num **evento** (o fim da
+ * cena, o conjurador parar de sustentar) —, e aí o nome do evento é o que há
+ * para mostrar.
  */
 function textoDaDuracao(efeito) {
+  if (!efeito.isTemporary) return "";
   const duracao = efeito.duration ?? {};
-  const temPrazo =
-    Number(duracao.seconds) > 0 || Number(duracao.rounds) > 0 || Number(duracao.turns) > 0;
-  return temPrazo ? (duracao.label ?? "") : "";
+  if (Number(duracao.value) > 0 && duracao.label) return duracao.label;
+
+  const evento = duracao.expiry ? CONFIG?.ActiveEffect?.expiryEvents?.[duracao.expiry] : "";
+  return evento ? t20Localize(evento, evento) : (duracao.label ?? "");
 }
 
 /**
@@ -1799,17 +1878,15 @@ function origemDoEfeito(efeito) {
  * com trinta bônus ligados o tempo todo.
  */
 export function getEfeitos(actor) {
-  // `allApplicableEffects` (Foundry v11+) junta os do ator com os dos itens
-  // que transferem; o `actor.effects` é o resguardo para uma versão que não o
-  // tenha, e nesse caso os de item ficam de fora.
-  const todos =
-    typeof actor.allApplicableEffects === "function"
-      ? [...actor.allApplicableEffects()]
-      : [...(actor.effects ?? [])];
+  // `allApplicableEffects` junta os do ator com os que moram nos itens dele.
+  // Ele é o único caminho desde o v14: o Foundry não copia mais o efeito do
+  // item para a ficha (a "transferência legada" acabou), então varrer só
+  // `actor.effects` deixaria de fora tudo que vem de poder e equipamento.
+  const todos = [...actor.allApplicableEffects()];
   const rollData = actor.getRollData();
 
   return todos
-    .filter((efeito) => !efeito.flags?.tormenta20?.onuse)
+    .filter((efeito) => !ehEfeitoDeUso(efeito))
     .map((efeito) => {
       const origem = origemDoEfeito(efeito);
       const duracao = textoDaDuracao(efeito);
@@ -1829,11 +1906,11 @@ export function getEfeitos(actor) {
         tipo: tipoDoEfeito(ativo, duracao),
         /** Mora na ficha, e não num item: só esse o jogador pode tirar daqui. */
         removivel: efeito.parent?.documentName !== "Item",
-        mudancas: (efeito.changes ?? []).map((mudanca) => ({
+        mudancas: mudancasDoEfeito(efeito).map((mudanca) => ({
           /** A chave crua, para o app poder reescrever o rótulo sem tocar no módulo. */
           chave: String(mudanca.key ?? ""),
           rotulo: rotuloDaMudanca(actor, mudanca.key),
-          modo: modoDaMudanca(mudanca.mode),
+          modo: modoDaMudanca(mudanca.type),
           valor: valorDaMudanca(mudanca.value, rollData)
         }))
       };
@@ -1864,7 +1941,7 @@ const FLAG_ATIVACAO = "ativacao";
  * própria no painel; estes são o que o poder liga na ficha ao ser ativado.
  */
 function efeitosDeAtivacao(item) {
-  return [...(item.effects ?? [])].filter((efeito) => !efeito.flags?.tormenta20?.onuse);
+  return [...(item.effects ?? [])].filter((efeito) => !ehEfeitoDeUso(efeito));
 }
 
 /** O efeito que este poder já ligou na ficha, se ainda estiver lá. */
@@ -1881,49 +1958,44 @@ function efeitoJaLigado(actor, item, efeito) {
  * Duração do efeito a partir da duração do poder — a mesma conversão que o
  * sistema faz em `applyOnUseEffects`. Sem isto, um efeito de "1 rodada"
  * entraria na ficha sem prazo nenhum e ficaria lá até alguém reparar.
+ *
+ * No v14 a duração é `{ value, units, expiry }`, e as unidades do sistema são
+ * as do core no singular ("round" → "rounds") — daí a checagem contra
+ * `CONST.ACTIVE_EFFECT_DURATION_UNITS`. Cena e sustentada não têm contagem:
+ * acabam num **evento** de expiração, que é justamente o que o v14 trouxe e
+ * o que o T20 1.6 registra (`CONFIG.ActiveEffect.expiryEvents`) — antes
+ * disto, "cena" virava um número alto de rodadas.
+ *
+ * `null` quer dizer "não sei converter" (instantânea, permanente, especial):
+ * aí vale o que o próprio efeito declarar.
  */
-function duracaoDeAtivacao(item, efeito) {
+function duracaoDeAtivacao(item) {
   const duracao = item.system?.duracao ?? {};
-  const valor = Number(duracao.value) || 1;
-  switch (duracao.units) {
-    // "Cena" não tem contagem no relógio do Foundry: o sistema usa um número
-    // alto de rodadas e limpa no fim da cena.
-    case "scene":
-      return { rounds: 99 };
-    case "turn":
-      return { turns: valor };
-    case "round":
-      return { rounds: valor };
-    case "minute":
-      return { seconds: valor * 60 };
-    case "hour":
-      return { seconds: valor * 3600 };
-    case "day":
-      return { seconds: valor * 86400 };
-    case "month":
-      return { seconds: valor * 86400 * 30 };
-    case "year":
-      return { seconds: valor * 86400 * 365 };
-    // Instantânea, permanente, sustentada ou especial: quem manda é o que o
-    // próprio efeito declarar.
-    default:
-      return efeito.duration ?? {};
+  const unidades = duracao.units;
+  if (!unidades) return null;
+
+  if (unidades === "scene") return { value: null, units: "rounds", expiry: "sceneEnd" };
+  if (unidades === "sust") return { value: null, units: "rounds", expiry: "sustainEnd" };
+
+  const doCore = `${unidades}s`;
+  if (CONST.ACTIVE_EFFECT_DURATION_UNITS.includes(doCore)) {
+    return { value: Number(duracao.value) || 1, units: doCore, expiry: "turnStart" };
   }
+  return null;
 }
 
 /** Os dados de um Active Effect prontos para entrar numa ficha. */
 function dadosDoEfeito(actor, item, efeito) {
   const dados = efeito.toObject();
   delete dados._id;
+  const duracao = duracaoDeAtivacao(item);
   return {
     ...dados,
     name: dados.name || item.name,
     img: dados.img || item.img,
-    // O template do card do sistema ainda lê `icon` (nome antigo do campo).
-    icon: dados.img || item.img,
     disabled: false,
     origin: item.uuid,
-    duration: duracaoDeAtivacao(item, efeito),
+    ...(duracao ? { duration: duracao } : {}),
     flags: {
       ...(dados.flags ?? {}),
       [MODULE_ID]: { [FLAG_ATIVACAO]: { itemId: item.id, efeitoId: efeito.id } }
@@ -1979,28 +2051,40 @@ async function ligarEfeitos(actor, item, ids) {
  * - **não passa por `item.roll()`**: aquele caminho rola os dados do item, e
  *   o princípio do projeto é que quem rola é a mesa, no dado físico. Aqui só
  *   se exibe o card;
- * - **custo zerado no clone**: o card do sistema traz um botão "gastar PM", e
+ * - **custo zerado no card**: o card do sistema traz um botão "gastar PM", e
  *   a essa altura o app já cobrou — com aprimoramentos e conferência de saldo.
- *   O que foi gasto vai no `flavor` da mensagem, como texto;
+ *   O que foi gasto vai no `flavor` da mensagem, como texto. No T20 1.6 o
+ *   valor exibido passou a vir de `options.manaCost`, em vez de o `displayCard`
+ *   recalculá-lo a partir do item — então zerá-lo é dizer isso, e não mais
+ *   clonar o item com o custo em zero;
  * - **autor é o jogador**, não o mestre em cujo client isto roda.
  */
 async function anunciarAtivacao(actor, user, item, { pm, gastos, aprimoramentos, efeitos }) {
   const gasto = textoDoGasto(pm, gastos);
   const nomes = nomesDeAprimoramentos(actor, aprimoramentos);
 
-  // Clone sem custo: some o botão de gastar PM do card, e nada mais muda.
-  const paraExibir = item.clone({ "system.ativacao.custo": 0 }, { keepId: true });
-
-  const dados = await paraExibir.displayCard({
-    options: {
-      itemId: item.id,
-      // Os aprimoramentos marcados, no formato que o template espera.
-      onUseEffects: nomes.map((nome) => ({ cost: "", qty: 1, description: escaparHtml(nome) })),
-      // Array de arrays: é como `_onChatCardApplyEffect` lê os efeitos do card.
-      effects: efeitos.map((efeito) => [efeito])
-    },
-    createMessage: false
-  });
+  let dados;
+  try {
+    dados = await item.displayCard({
+      options: {
+        itemId: item.id,
+        // Zero: o botão de gastar PM do card não aparece, e o gasto vai no flavor.
+        manaCost: 0,
+        // Os aprimoramentos marcados, no formato que o template espera.
+        onUseEffects: nomes.map((nome) => ({ cost: "", qty: 1, description: escaparHtml(nome) })),
+        // Array de arrays: é como `_onChatCardApplyEffect` lê os efeitos do card.
+        effects: efeitos.map((efeito) => [efeito])
+      },
+      createMessage: false
+    });
+  } catch (erro) {
+    // O card é do sistema, e monta muita coisa (descrição enriquecida,
+    // condições citadas no texto, rolagens). Se ele falhar, o poder já foi
+    // ativado e o custo já saiu da ficha — a mesa precisa saber disso de
+    // qualquer jeito, então cai no aviso simples em vez de derrubar o uso.
+    warn(`O card de "${item.name}" não pôde ser montado: ${erro.message}`);
+    return anunciarGasto(actor, user, item.name, pm, gastos);
+  }
 
   return ChatMessage.implementation.create({
     ...dados,
@@ -2098,9 +2182,25 @@ function valorNumerico(actor, bruto) {
 }
 
 /**
+ * O `mode` numérico que o app ainda usa para saber se um aprimoramento
+ * substitui o campo (5) ou soma nele. O Foundry v14 passou a dizer isso em
+ * texto, e a tradução mora aqui para o contrato com o front-end seguir o
+ * mesmo — nada muda do lado de lá por causa da migração.
+ *
+ * "add", "subtract" e "custom" caem no padrão 2 (soma), que é como o app os
+ * trata de qualquer forma.
+ */
+const MODO_LEGADO_DO_TIPO = { multiply: 1, downgrade: 3, upgrade: 4, override: 5 };
+
+function modoLegado(tipo) {
+  return MODO_LEGADO_DO_TIPO[String(tipo ?? "")] ?? 2;
+}
+
+/**
  * Escopos de um Active Effect "de uso" (`onuse`), como o próprio sistema os
- * nomeia no formulário de configuração (templates/apps/onuse-effect-config).
- * Um efeito pode marcar mais de um.
+ * nomeia no schema (`system.abilityUse.types`, ver `BaseEffect`). Um efeito
+ * pode marcar mais de um. Até o T20 1.5 cada escopo era uma flag separada;
+ * hoje é um `Set` com estas chaves.
  */
 const ESCOPOS_APRIMORAMENTO = [
   "skill",
@@ -2113,13 +2213,6 @@ const ESCOPOS_APRIMORAMENTO = [
   "self"
 ];
 
-/**
- * A restrição por nome (`flags.tormenta20.items`) é um texto solto preenchido
- * à mão. O sistema separa por ";", mas na prática aparece vírgula também
- * ("arpão, rede, tridente"), e os nomes vêm sem acento ("Religiao" para
- * Religião) — por isso aceitamos os dois separadores e devolvemos os nomes
- * como escritos, deixando a comparação tolerante para quem consome.
- */
 /**
  * Ícone genérico que o Foundry dá a um efeito recém-criado. Não diz nada — a
  * imagem do poder que originou o efeito é o que identifica a habilidade.
@@ -2139,14 +2232,6 @@ function itemDeOrigem(actor, efeito) {
   return partes.at(-2) === "Item" && id ? actor.items?.get?.(id) ?? null : null;
 }
 
-function listaDeNomes(bruto) {
-  if (!bruto) return [];
-  return String(bruto)
-    .split(/[;,]/)
-    .map((nome) => nome.trim())
-    .filter(Boolean);
-}
-
 /**
  * Tudo que o personagem pode ativar durante um uso, com o custo em PM e os
  * modificadores que aplica. É o mecanismo nativo do sistema — Active Effects
@@ -2157,10 +2242,14 @@ function listaDeNomes(bruto) {
  *
  * - **`disabled: true` é o estado normal** de um efeito `onuse`: ele fica
  *   desligado porque só vale quando escolhido no uso. Filtrar por `disabled`
- *   descartaria todos.
+ *   descartaria todos — e quem diz que o aprimoramento é automático (o "+1 na
+ *   CD" que o personagem tem sempre) é `abilityUse.automatic`, campo próprio
+ *   desde o T20 1.6; antes disso era o `disabled` que carregava as duas
+ *   informações.
  * - **O efeito costuma morar no item, não no ator** (`transfer: false`), então
  *   varremos `item.effects` além de `actor.effects`.
- * - **`custo` é string** ("2", "" quando é de graça, "-1" quando reduz).
+ * - **`custo` é número ou `null`** (nulo = de graça; negativo = reduz). Era
+ *   texto até o 1.5.
  * - **Os valores dos `changes` podem ser fórmula** ("@int", "1d8"): o que
  *   resolve para número vem em `valor`; o resto fica só em `formula`.
  */
@@ -2169,40 +2258,40 @@ export function getAprimoramentos(actor) {
   const vistos = new Set();
 
   function registrar(efeito, itemPai) {
-    const flags = efeito?.flags?.tormenta20;
-    if (!flags?.onuse) return;
+    if (!ehEfeitoDeUso(efeito)) return;
 
-    // `skill` é o nome usado por validOnUseEffects; `pericia`, o de rollPericia.
-    const escopos = ESCOPOS_APRIMORAMENTO.filter((escopo) => flags[escopo]);
-    if (flags.pericia && !escopos.includes("skill")) escopos.push("skill");
+    const uso = dadosDeUso(efeito);
+    const escopos = ESCOPOS_APRIMORAMENTO.filter((escopo) => uso.types?.has?.(escopo));
     if (!escopos.length) return;
 
     const item = itemPai ?? itemDeOrigem(actor, efeito);
-    const nome = efeito.name || efeito.label || item?.name || "Aprimoramento";
-    const custo = Number(flags.custo) || 0;
+    const nome = efeito.name || item?.name || "Aprimoramento";
+    const custo = Number(uso.custo) || 0;
     // A chave de deduplicação é a origem + o nome + o custo, e cada pedaço
     // resolve um caso medido em ficha de verdade:
     //
     // - **origem**: escrever um pergaminho copia os efeitos da magia com nome
     //   e custo iguais. Sem ela, o pergaminho herdava os aprimoramentos da
     //   magia — isto é, sumiam do painel dele, que os acha pela origem.
-    // - **nome + custo, e não o id do efeito**: um efeito `transfer: true`
-    //   aparece nos dois lugares, no item e no ator, com **ids diferentes**
-    //   (o do ator é uma cópia). Deduplicar por id deixava passar os dois, e
-    //   o Líquen Lilás aparecia repetido na lista.
+    // - **nome + custo, e não o id do efeito**: dois documentos diferentes
+    //   podem ser o mesmo aprimoramento aos olhos do jogador (o Líquen Lilás
+    //   que está no item e na ficha). Deduplicar por id deixaria os dois
+    //   passarem. O caso mais comum disso — a cópia que o Foundry fazia no
+    //   ator de todo efeito `transfer: true` — acabou no v14, mas a chave
+    //   continua valendo para o resto.
     const origem = item?.id ?? "ator";
     const chave = `${origem}|${nome}|${custo}`;
     if (vistos.has(chave)) return;
     vistos.add(chave);
 
-    const modificadores = (efeito.changes ?? []).map((change) => ({
+    const modificadores = mudancasDoEfeito(efeito).map((change) => ({
       chave: String(change?.key ?? ""),
       valor: valorNumerico(actor, change?.value),
       formula: String(change?.value ?? ""),
       // Modo do Active Effect: 5 (SUBSTITUI) troca o campo — "o alcance passa
       // a ser curto" —, os outros somam ao que já havia. Sem isso não dá pra
       // saber se um aprimoramento de alcance substitui ou acrescenta.
-      modo: Number(change?.mode) || 0
+      modo: modoLegado(change?.type)
     }));
 
     lista.push({
@@ -2213,7 +2302,7 @@ export function getAprimoramentos(actor) {
       // tem ligado o tempo todo (o "+1 na CD" do Xamã Místico), não uma opção
       // a marcar na hora. Os demais chegam desabilitados justamente porque
       // são escolha de uso.
-      ativoPorPadrao: !efeito.disabled,
+      ativoPorPadrao: !!uso.automatic,
       // De qual item o efeito veio: um efeito de escopo "self" só vale para
       // o próprio item (a "Maciça" é upgrade de uma arma, não de todas).
       origemId: item?.id ?? null,
@@ -2221,11 +2310,11 @@ export function getAprimoramentos(actor) {
       // A imagem do poder identifica a habilidade; a do efeito costuma ser o
       // ícone genérico do Foundry, que não diz nada. Só caímos nela quando o
       // efeito tem imagem própria de verdade e não há item de origem.
-      img: item?.img || (eIconeGenerico(efeito.img || efeito.icon) ? "" : efeito.img || efeito.icon),
-      descricao: resolverReferencias(efeito.description || item?.system?.description?.value),
+      img: item?.img || (eIconeGenerico(efeito.img) ? "" : efeito.img),
+      descricao: resolverReferencias(uso.description || efeito.description || item?.system?.description?.value),
       custo,
       escopos,
-      restritoA: listaDeNomes(flags.items),
+      restritoA: [...(uso.names ?? [])],
       // Aprimoramento que mora num consumível é o consumível sendo usado: o
       // pó que se joga na magia, a erva que se mastiga antes do teste. Marcar
       // na tela é gastar uma unidade dele.
@@ -2238,7 +2327,7 @@ export function getAprimoramentos(actor) {
         item?.type === "consumivel" && !escopos.includes("self") ? consumoDeItem(item, 1) : null,
       modificadores,
       // Aprimoramento repetível: pode ser aplicado mais de uma vez, pagando de novo.
-      aumenta: !!flags.aumenta
+      aumenta: !!uso.aumenta
     });
   }
 

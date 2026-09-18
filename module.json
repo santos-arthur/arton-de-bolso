@@ -10,14 +10,18 @@
     }
   ],
   "compatibility": {
-    "minimum": "13",
-    "verified": "13"
+    "minimum": "14",
+    "verified": "14"
   },
   "relationships": {
     "systems": [
       {
         "id": "tormenta20",
-        "type": "system"
+        "type": "system",
+        "compatibility": {
+          "minimum": "1.6.0",
+          "verified": "1.6.2"
+        }
       }
     ]
   },

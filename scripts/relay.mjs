@@ -643,6 +643,11 @@ export function registrarRelay() {
   // efeito que o mestre desabilita na ficha) não dispara os hooks acima. Sem
   // estes três, ativar um poder só chegava ao app de carona no `updateActor`
   // do PM gasto — e um poder que não custa nada não chegava de jeito nenhum.
+  //
+  // No Foundry v14 eles também cobrem o efeito que acaba sozinho: prazo
+  // vencido, fim da cena, conjurador que parou de sustentar. O sistema manda
+  // o core apagar o efeito nesses casos (`CONFIG.ActiveEffect.expiryAction`),
+  // e é o `deleteActiveEffect` que leva a ficha nova pro celular.
   for (const evento of ["createActiveEffect", "updateActiveEffect", "deleteActiveEffect"]) {
     Hooks.on(evento, (efeito) => marcarAtor(atorDoEfeito(efeito)));
   }
