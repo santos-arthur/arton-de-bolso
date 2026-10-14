@@ -73,14 +73,59 @@ export function periciasDeRender(actor) {
   return lista;
 }
 
-/** Os negócios deste personagem que o usuário enxerga. */
-function negociosDoAtor(actor, user) {
+/** A entrada do personagem em `system.beneficiarios` — quem tem acesso aos benefícios do negócio. */
+function beneficiarioDe(negocio, actor) {
+  return (negocio.system.beneficiarios ?? []).find((b) => b.actorId === actor.id) ?? null;
+}
+
+/**
+ * Os negócios que aparecem para quem olha `actor`: os dele e aqueles de que
+ * ele faz parte (beneficiário), mesmo sendo de outro personagem — é lá que
+ * ele vê os bônus que recebe. A posse do documento não entra na conta: um
+ * negócio fundado pelo mestre nem sempre dá ownership ao jogador.
+ */
+function negociosVisiveis(actor) {
   return game.actors
-    .filter((a) => ehNegocio(a) && a.system.proprietario === actor.id && a.testUserPermission(user, "OBSERVER"))
+    .filter((a) => ehNegocio(a) && (a.system.proprietario === actor.id || !!beneficiarioDe(a, actor)))
     .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
 }
 
-function mapearNegocio(negocio, user) {
+/**
+ * O que o negócio dá ao personagem, pela conta do próprio módulo
+ * (`Beneficios.beneficiosDe`). Só para beneficiários — o proprietário que não
+ * se inscreveu como beneficiário não recebe nada.
+ */
+function beneficiosPara(negocio, actor) {
+  const beneficiario = beneficiarioDe(negocio, actor);
+  const { Beneficios } = api();
+  if (!beneficiario || !Beneficios?.beneficiosDe) return null;
+  const { automaticos, lembretes, bloqueados } = Beneficios.beneficiosDe(negocio, beneficiario);
+  const simples = (b) => ({
+    nome: b.nome,
+    efeito: b.efeito ?? "",
+    escolha: b.escolha || "",
+    naFicha: (b.changes?.length ?? 0) > 0,
+    naRolagem: !!b.naRolagem
+  });
+  return {
+    automaticos: automaticos.map(simples),
+    lembretes: lembretes.map(simples),
+    bloqueados: bloqueados.map((b) => ({ nome: b.nome, motivo: b.condicao ?? "" }))
+  };
+}
+
+/**
+ * Quem administra um negócio: o jogador do personagem proprietário — mesma
+ * regra do `podeAdministrar` do módulo, que olha a posse do proprietário e
+ * não a do documento do negócio. Aqui `game.user` é o mestre, então a regra
+ * é refeita para o usuário que pediu.
+ */
+function administra(negocio, user) {
+  const proprietario = negocio.system.atorProprietario;
+  return !!proprietario && proprietario.testUserPermission(user, "OWNER");
+}
+
+function mapearNegocio(negocio, actor, user) {
   const { ATIVOS, Regras } = api();
   const sistema = negocio.system;
   const emporio = sistema.temEmporio;
@@ -121,7 +166,18 @@ function mapearNegocio(negocio, user) {
     emporio,
     ativos,
     registro,
-    podeRender: negocio.testUserPermission(user, "OWNER")
+    // O dinheiro do saque e do depósito é sempre o do proprietário, que nem
+    // sempre é o personagem aberto.
+    proprietario: sistema.atorProprietario?.name ?? null,
+    doPersonagem: sistema.proprietario === actor.id,
+    beneficios: beneficiosPara(negocio, actor),
+    // Quem frequenta o negócio e recebe os benefícios dele.
+    frequentadores: (sistema.beneficiarios ?? [])
+      .map((b) => game.actors.get(b.actorId))
+      .filter(Boolean)
+      .map((a) => ({ id: a.id, nome: a.name, img: a.img })),
+    tibaresDoProprietario: tibaresDe(sistema.atorProprietario),
+    podeRender: administra(negocio, user)
   };
 }
 
@@ -137,7 +193,7 @@ export function listarNegocios(actor, user) {
   }
   return {
     disponivel: true,
-    negocios: negociosDoAtor(actor, user).map((negocio) => mapearNegocio(negocio, user)),
+    negocios: negociosVisiveis(actor).map((negocio) => mapearNegocio(negocio, actor, user)),
     pericias: periciasDeRender(actor),
     tibaresNaMao: tibaresDe(actor)
   };
@@ -152,14 +208,15 @@ function tibaresDe(actor) {
 /**
  * O negócio que o front pediu, desde que seja deste personagem e quem pede o
  * administre — a mesma regra que o módulo aplica na ficha dele. O id vem do
- * celular, então é aqui que ele deixa de ser confiado.
+ * celular, então é aqui que ele deixa de ser confiado. As gravações saem do
+ * client do mestre, então não depende de o jogador ter posse do negócio.
  */
 function negocioAdministrado(actor, user, negocioId) {
   const negocio = game.actors.get(negocioId);
-  if (!ehNegocio(negocio) || negocio.system.proprietario !== actor.id) {
+  if (!ehNegocio(negocio) || !(negocio.system.proprietario === actor.id || beneficiarioDe(negocio, actor))) {
     throw new Error("Este negócio não é do personagem aberto.");
   }
-  if (!negocio.testUserPermission(user, "OWNER")) {
+  if (!administra(negocio, user)) {
     throw new Error(`Você não administra ${negocio.name}.`);
   }
   return negocio;
@@ -221,9 +278,11 @@ export async function movimentarCofre(actor, user, { negocioId, operacao, quanti
   }
 
   if (operacao === "depositar") {
-    const naMao = tibaresDe(actor);
-    if (naMao === null) throw new Error(`Não consegui ler os T$ de ${actor.name}.`);
-    if (valor > naMao) throw new Error(`${actor.name} tem só T$ ${naMao}.`);
+    // Quem paga o depósito é o proprietário — é dele que o módulo debita.
+    const proprietario = negocio.system.atorProprietario;
+    const naMao = tibaresDe(proprietario);
+    if (naMao === null) throw new Error(`Não consegui ler os T$ de ${proprietario?.name ?? "quem é dono do negócio"}.`);
+    if (valor > naMao) throw new Error(`${proprietario.name} tem só T$ ${naMao}.`);
     return modulo.Operacoes.guardar(negocio, valor);
   }
 

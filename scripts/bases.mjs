@@ -62,15 +62,15 @@ function administra(base, user) {
   return proprietario ? proprietario.testUserPermission(user, "OWNER") : true;
 }
 
-/** As bases deste personagem — dele ou em que ele mora — que o usuário enxerga. */
-function basesDoAtor(actor, user) {
+/**
+ * As bases deste personagem — dele ou em que ele mora. Como nos negócios, a
+ * posse do documento da base não entra na conta para ver: quem chegou aqui
+ * já enxerga o personagem, e uma base criada pelo mestre nem sempre dá
+ * ownership aos residentes. Administrar continua exigindo (ver `administra`).
+ */
+function basesDoAtor(actor) {
   return game.actors
-    .filter(
-      (a) =>
-        ehBase(a) &&
-        (flag(a, "proprietario") === actor.id || residentesDe(a).includes(actor.id)) &&
-        a.testUserPermission(user, "OBSERVER")
-    )
+    .filter((a) => ehBase(a) && (flag(a, "proprietario") === actor.id || residentesDe(a).includes(actor.id)))
     .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
 }
 
@@ -211,7 +211,7 @@ export function listarBases(actor, user) {
   if (!disponivel() || !actor) return { disponivel: disponivel(), bases: [] };
   return {
     disponivel: true,
-    bases: basesDoAtor(actor, user).map((base) => mapearBase(base, actor, user))
+    bases: basesDoAtor(actor).map((base) => mapearBase(base, actor, user))
   };
 }
 
