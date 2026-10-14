@@ -39,6 +39,10 @@
  *     { tipo: "obterNegocios" }
  *     { tipo: "renderNegocio", negocioId, pericia?, d20? }
  *     { tipo: "movimentarCofre", negocioId, operacao: "sacar"|"depositar", quantia }
+ *     { tipo: "obterBases" }
+ *     { tipo: "iniciarAventuraBase", baseId, pagar, danificarId? }
+ *     { tipo: "repararComodo", baseId, comodoId }
+ *     { tipo: "apurarEmpreendimento", baseId, d20, dedicado }
  *   Foundry → Front (sempre só para o userId a quem a mensagem diz respeito):
  *     { tipo: "personagens", meus: [...], companheiros: [...] }
  *     { tipo: "ficha", ficha: <getFichaCompleta + somenteLeitura> }
@@ -47,6 +51,7 @@
  *     { tipo: "compendio", compendio: { pastas: [...], journals: [{ id, nome, paginas: [...] }] } }
  *     { tipo: "combate", combate: { ativo, rodada, comecou, combatentes: [...] } }
  *     { tipo: "negocios", negocios: { disponivel, negocios: [...], pericias: [...] } }
+ *     { tipo: "bases", bases: { disponivel, bases: [...] } }
  *     { tipo: "erro", mensagem }
  *
  * Autorização: cada mensagem chega com o userId de quem enviou, verificado
@@ -71,6 +76,7 @@ import * as diarios from "./diarios.mjs";
 import * as compendio from "./compendio.mjs";
 import * as combate from "./combate.mjs";
 import * as negocios from "./negocios.mjs";
+import * as bases from "./bases.mjs";
 import { MODULE_ID as ID_DO_MODULO } from "./constantes.mjs";
 
 const EVENTO = `module.${MODULE_ID}`;
@@ -110,7 +116,11 @@ const TIPOS_DO_FRONT = new Set([
   "definirIniciativa",
   "obterNegocios",
   "renderNegocio",
-  "movimentarCofre"
+  "movimentarCofre",
+  "obterBases",
+  "iniciarAventuraBase",
+  "repararComodo",
+  "apurarEmpreendimento"
 ]);
 
 /**
@@ -147,7 +157,12 @@ const TIPOS_ESCRITA = new Set([
   // confere as duas: a do personagem aqui e a do negócio lá.
   "renderNegocio",
   // Mexe no cofre do negócio e na bolsa do personagem ao mesmo tempo.
-  "movimentarCofre"
+  "movimentarCofre",
+  // Escrevem na base, que também tem posse própria — `bases.mjs` confere se
+  // quem pede administra a base, além do OWNER do personagem aqui.
+  "iniciarAventuraBase",
+  "repararComodo",
+  "apurarEmpreendimento"
 ]);
 
 function warn(mensagem) {
@@ -248,6 +263,7 @@ const ultimosDiariosEnviados = new Map();
 const ultimoCompendioEnviado = new Map();
 const ultimoCombateEnviado = new Map();
 const ultimosNegociosEnviados = new Map();
+const ultimasBasesEnviadas = new Map();
 
 /**
  * Quem já pediu os diários alguma vez — e portanto tem a tela de anotações
@@ -276,6 +292,13 @@ let combateSujo = false;
  */
 const interessadosEmNegocios = new Set();
 let negociosSujos = false;
+
+/**
+ * E para as bases, pelo mesmo motivo: a lista é do personagem aberto — as
+ * bases dele, e o que cada uma dá a ele como residente.
+ */
+const interessadosEmBases = new Set();
+let basesSujas = false;
 
 function agendarPassagem() {
   if (passagemAgendada) return;
@@ -338,6 +361,12 @@ function marcarCombate() {
 function marcarNegocios() {
   if (!interessadosEmNegocios.size) return;
   negociosSujos = true;
+  agendarPassagem();
+}
+
+function marcarBases() {
+  if (!interessadosEmBases.size) return;
+  basesSujas = true;
   agendarPassagem();
 }
 
@@ -433,13 +462,23 @@ function enviarNegocios(user, ator, forcar = false) {
   enviar(user.id, { tipo: "negocios", negocios: estado });
 }
 
+/** As bases do personagem que este usuário está olhando — mesma convenção. */
+function enviarBases(user, ator, forcar = false) {
+  const actor = ator === undefined ? resolverAtor(user) : ator;
+  const estado = bases.listarBases(actor, user);
+  const serializada = JSON.stringify(estado);
+  if (!forcar && ultimasBasesEnviadas.get(user.id) === serializada) return;
+  ultimasBasesEnviadas.set(user.id, serializada);
+  enviar(user.id, { tipo: "bases", bases: estado });
+}
+
 /**
  * Os módulos irmãos que liberam telas no app. Vai junto da ficha: ligar ou
  * desligar um módulo exige recarregar o Foundry, então não há hook para isso
  * — a próxima ficha montada já sai com o valor certo.
  */
 function modulosDisponiveis() {
-  return { negocios: negocios.disponivel() };
+  return { negocios: negocios.disponivel(), bases: bases.disponivel() };
 }
 
 /** Resposta a um pedido explícito do front: manda tudo, mesmo que nada tenha mudado. */
@@ -447,6 +486,7 @@ function enviarEstado(user) {
   enviarLista(user, true);
   enviarFicha(user, undefined, true);
   if (interessadosEmNegocios.has(user.id)) enviarNegocios(user, undefined, true);
+  if (interessadosEmBases.has(user.id)) enviarBases(user, undefined, true);
 }
 
 function enviarErro(userId, mensagem) {
@@ -461,6 +501,7 @@ function processarPendencias() {
   const recalcularCompendio = compendioSujo;
   const recalcularCombate = combateSujo;
   const recalcularNegocios = negociosSujos;
+  const recalcularBases = basesSujas;
   atoresPendentes.clear();
   usuariosPendentes.clear();
   listasSujas = false;
@@ -468,6 +509,7 @@ function processarPendencias() {
   compendioSujo = false;
   combateSujo = false;
   negociosSujos = false;
+  basesSujas = false;
 
   const todos = [...game.users];
 
@@ -515,6 +557,7 @@ function processarPendencias() {
     enviarLista(user, true);
     enviarFicha(user, atorDe(user), true);
     if (interessadosEmNegocios.has(userId)) enviarNegocios(user, atorDe(user), true);
+    if (interessadosEmBases.has(userId)) enviarBases(user, atorDe(user), true);
     jaAtendidos.add(userId);
   }
 
@@ -524,6 +567,13 @@ function processarPendencias() {
     for (const userId of interessadosEmNegocios) {
       const user = game.users.get(userId);
       if (user) enviarNegocios(user, atorDe(user));
+    }
+  }
+
+  if (recalcularBases) {
+    for (const userId of interessadosEmBases) {
+      const user = game.users.get(userId);
+      if (user) enviarBases(user, atorDe(user));
     }
   }
 
@@ -654,6 +704,7 @@ async function tratarMensagem(mensagem, senderUserId) {
   // com mais de um personagem próprio) recebe a lista assim que escolher —
   // `enviarEstado` já a inclui para os inscritos.
   if (tipo === "obterNegocios") interessadosEmNegocios.add(user.id);
+  if (tipo === "obterBases") interessadosEmBases.add(user.id);
 
   const actor = resolverAtor(user);
   if (!actor) {
@@ -665,6 +716,11 @@ async function tratarMensagem(mensagem, senderUserId) {
     // Já inscrito lá em cima: o rendimento apurado, o ativo que o mestre
     // contratou ou o nível que subiu chegam sozinhos na tela.
     enviarNegocios(user, actor, true);
+    return;
+  }
+
+  if (tipo === "obterBases") {
+    enviarBases(user, actor, true);
     return;
   }
 
@@ -762,6 +818,26 @@ async function tratarMensagem(mensagem, senderUserId) {
         });
         break;
       }
+      case "iniciarAventuraBase": {
+        await bases.iniciarAventura(actor, user, {
+          baseId: mensagem.baseId,
+          pagar: mensagem.pagar === true,
+          danificarId: mensagem.danificarId ?? null
+        });
+        break;
+      }
+      case "repararComodo": {
+        await bases.repararComodo(actor, user, { baseId: mensagem.baseId, comodoId: mensagem.comodoId });
+        break;
+      }
+      case "apurarEmpreendimento": {
+        await bases.apurarEmpreendimento(actor, user, {
+          baseId: mensagem.baseId,
+          d20: mensagem.d20,
+          dedicado: mensagem.dedicado === true
+        });
+        break;
+      }
       default:
         warn(`Mensagem com tipo desconhecido ignorada: "${tipo}"`);
     }
@@ -784,6 +860,9 @@ export function registrarRelay() {
     // bônus de Nobreza e de Ofício). `marcarNegocios` não faz nada se ninguém
     // estiver com a tela aberta, e a lista igual à última não sai.
     if (negocios.ehNegocio(actor) || actor?.type === "character") marcarNegocios();
+    // A base em si, e o personagem: nome, INT do Empreendimento, e — quando a
+    // base vincula um negócio — o nível dele.
+    if (bases.ehBase(actor) || actor?.type === "character" || negocios.ehNegocio(actor)) marcarBases();
     if (actor?.type === "character" && mudancaAfetaListas(changes)) marcarListas();
   });
 
@@ -795,6 +874,8 @@ export function registrarRelay() {
       if (item?.parent?.type === "character" && item.type === "classe") marcarListas();
       // Item e efeito mexem no bônus de Nobreza/Ofício que a tela de negócios mostra.
       if (item?.parent?.type === "character") marcarNegocios();
+      // Cômodos e mobílias são Itens dentro da base.
+      if (bases.ehBase(item?.parent)) marcarBases();
     });
   }
 
@@ -813,16 +894,26 @@ export function registrarRelay() {
       const ator = atorDoEfeito(efeito);
       marcarAtor(ator);
       if (ator?.type === "character") marcarNegocios();
+      // Danificar e reparar ligam e desligam os efeitos dos cômodos.
+      if (bases.ehBase(ator)) marcarBases();
     });
   }
+
+  // Ligar a regra de negócios do Empreendimento muda como a base rende — sem
+  // isto, a tela aberta só veria a troca no próximo push.
+  Hooks.on("updateSetting", (configuracao) => {
+    if (configuracao?.key === "t20-bases.empreendimentoComoNegocio") marcarBases();
+  });
 
   Hooks.on("createActor", (actor) => {
     marcarListas();
     if (negocios.ehNegocio(actor)) marcarNegocios();
+    if (bases.ehBase(actor)) marcarBases();
   });
   Hooks.on("deleteActor", (actor) => {
     marcarListas();
     if (negocios.ehNegocio(actor)) marcarNegocios();
+    if (bases.ehBase(actor)) marcarBases();
   });
 
   // ---- Combate ---------------------------------------------------------------
