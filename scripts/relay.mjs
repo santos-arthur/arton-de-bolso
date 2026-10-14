@@ -36,6 +36,9 @@
  *     { tipo: "obterCompendio" }
  *     { tipo: "obterCombate" }
  *     { tipo: "definirIniciativa", d20, aprimoramentos: [{ id, vezes }] }
+ *     { tipo: "obterNegocios" }
+ *     { tipo: "renderNegocio", negocioId, pericia?, d20? }
+ *     { tipo: "movimentarCofre", negocioId, operacao: "sacar"|"depositar", quantia }
  *   Foundry → Front (sempre só para o userId a quem a mensagem diz respeito):
  *     { tipo: "personagens", meus: [...], companheiros: [...] }
  *     { tipo: "ficha", ficha: <getFichaCompleta + somenteLeitura> }
@@ -43,6 +46,7 @@
  *     { tipo: "diarios", diarios: [{ id, nome, meu, paginas: [...] }] }
  *     { tipo: "compendio", compendio: { pastas: [...], journals: [{ id, nome, paginas: [...] }] } }
  *     { tipo: "combate", combate: { ativo, rodada, comecou, combatentes: [...] } }
+ *     { tipo: "negocios", negocios: { disponivel, negocios: [...], pericias: [...] } }
  *     { tipo: "erro", mensagem }
  *
  * Autorização: cada mensagem chega com o userId de quem enviou, verificado
@@ -66,6 +70,7 @@ import * as adaptador from "./adaptador-tormenta20.mjs";
 import * as diarios from "./diarios.mjs";
 import * as compendio from "./compendio.mjs";
 import * as combate from "./combate.mjs";
+import * as negocios from "./negocios.mjs";
 import { MODULE_ID as ID_DO_MODULO } from "./constantes.mjs";
 
 const EVENTO = `module.${MODULE_ID}`;
@@ -102,7 +107,10 @@ const TIPOS_DO_FRONT = new Set([
   "excluirPaginaDiario",
   "obterCompendio",
   "obterCombate",
-  "definirIniciativa"
+  "definirIniciativa",
+  "obterNegocios",
+  "renderNegocio",
+  "movimentarCofre"
 ]);
 
 /**
@@ -134,7 +142,12 @@ const TIPOS_ESCRITA = new Set([
   "removerEfeito",
   // Escreve no combatente, não no ator — mas quem manda na iniciativa de um
   // personagem é quem manda no personagem.
-  "definirIniciativa"
+  "definirIniciativa",
+  // Escreve no negócio, que tem posse própria — `negocios.renderNegocio`
+  // confere as duas: a do personagem aqui e a do negócio lá.
+  "renderNegocio",
+  // Mexe no cofre do negócio e na bolsa do personagem ao mesmo tempo.
+  "movimentarCofre"
 ]);
 
 function warn(mensagem) {
@@ -234,6 +247,7 @@ const ultimaFichaEnviada = new Map();
 const ultimosDiariosEnviados = new Map();
 const ultimoCompendioEnviado = new Map();
 const ultimoCombateEnviado = new Map();
+const ultimosNegociosEnviados = new Map();
 
 /**
  * Quem já pediu os diários alguma vez — e portanto tem a tela de anotações
@@ -254,6 +268,14 @@ let compendioSujo = false;
  */
 const interessadosEmCombate = new Set();
 let combateSujo = false;
+
+/**
+ * E para os negócios. Diferente do combate, a lista depende de quem olha: são
+ * os negócios do personagem aberto, com o bônus de perícia dele — por isso é
+ * montada por usuário, e trocar de personagem também a reenvia.
+ */
+const interessadosEmNegocios = new Set();
+let negociosSujos = false;
 
 function agendarPassagem() {
   if (passagemAgendada) return;
@@ -313,6 +335,12 @@ function marcarCombate() {
   agendarPassagem();
 }
 
+function marcarNegocios() {
+  if (!interessadosEmNegocios.size) return;
+  negociosSujos = true;
+  agendarPassagem();
+}
+
 /** Envia a lista só se ela mudou de verdade (ou se o front pediu explicitamente). */
 function enviarLista(user, forcar = false) {
   const listas = listaDePersonagens(user);
@@ -350,6 +378,7 @@ function enviarFicha(user, ator, forcar = false) {
   // (quem autoriza é o TIPOS_ESCRITA + OWNER lá embaixo).
   const ficha = adaptador.getFichaCompleta(actor);
   ficha.somenteLeitura = !actor.testUserPermission(user, "OWNER");
+  ficha.modulos = modulosDisponiveis();
   enviarFichaMontada(user, ficha, forcar);
 }
 
@@ -391,10 +420,33 @@ function enviarCombate(user, lista, forcar = false) {
   enviar(user.id, { tipo: "combate", combate: lista });
 }
 
+/**
+ * Os negócios do personagem que este usuário está olhando. `ator` segue a
+ * mesma convenção de `enviarFicha`: omitido, resolve na hora.
+ */
+function enviarNegocios(user, ator, forcar = false) {
+  const actor = ator === undefined ? resolverAtor(user) : ator;
+  const estado = negocios.listarNegocios(actor, user);
+  const serializada = JSON.stringify(estado);
+  if (!forcar && ultimosNegociosEnviados.get(user.id) === serializada) return;
+  ultimosNegociosEnviados.set(user.id, serializada);
+  enviar(user.id, { tipo: "negocios", negocios: estado });
+}
+
+/**
+ * Os módulos irmãos que liberam telas no app. Vai junto da ficha: ligar ou
+ * desligar um módulo exige recarregar o Foundry, então não há hook para isso
+ * — a próxima ficha montada já sai com o valor certo.
+ */
+function modulosDisponiveis() {
+  return { negocios: negocios.disponivel() };
+}
+
 /** Resposta a um pedido explícito do front: manda tudo, mesmo que nada tenha mudado. */
 function enviarEstado(user) {
   enviarLista(user, true);
   enviarFicha(user, undefined, true);
+  if (interessadosEmNegocios.has(user.id)) enviarNegocios(user, undefined, true);
 }
 
 function enviarErro(userId, mensagem) {
@@ -408,12 +460,14 @@ function processarPendencias() {
   const recalcularDiarios = diariosSujos;
   const recalcularCompendio = compendioSujo;
   const recalcularCombate = combateSujo;
+  const recalcularNegocios = negociosSujos;
   atoresPendentes.clear();
   usuariosPendentes.clear();
   listasSujas = false;
   diariosSujos = false;
   compendioSujo = false;
   combateSujo = false;
+  negociosSujos = false;
 
   const todos = [...game.users];
 
@@ -460,7 +514,17 @@ function processarPendencias() {
     if (!user) continue;
     enviarLista(user, true);
     enviarFicha(user, atorDe(user), true);
+    if (interessadosEmNegocios.has(userId)) enviarNegocios(user, atorDe(user), true);
     jaAtendidos.add(userId);
+  }
+
+  // Depois do laço acima, que já mandou a lista a quem trocou de personagem;
+  // aqui o filtro de "já mandei isto" segura o que não mudou.
+  if (recalcularNegocios) {
+    for (const userId of interessadosEmNegocios) {
+      const user = game.users.get(userId);
+      if (user) enviarNegocios(user, atorDe(user));
+    }
   }
 
   for (const actorId of atores) {
@@ -480,7 +544,7 @@ function processarPendencias() {
     // Uma montagem só serve pra todo mundo: entre dono e observador a única
     // diferença é a flag. getFichaCompleta é a parte cara (monta as fórmulas
     // de todas as perícias), então não pode rodar por destinatário.
-    const base = adaptador.getFichaCompleta(actor);
+    const base = { ...adaptador.getFichaCompleta(actor), modulos: modulosDisponiveis() };
     for (const user of interessados) {
       enviarFichaMontada(user, { ...base, somenteLeitura: !actor.testUserPermission(user, "OWNER") }, false);
     }
@@ -586,9 +650,21 @@ async function tratarMensagem(mensagem, senderUserId) {
     return;
   }
 
+  // Inscreve antes de resolver o personagem: quem ainda não escolheu um (F5
+  // com mais de um personagem próprio) recebe a lista assim que escolher —
+  // `enviarEstado` já a inclui para os inscritos.
+  if (tipo === "obterNegocios") interessadosEmNegocios.add(user.id);
+
   const actor = resolverAtor(user);
   if (!actor) {
     enviarEstado(user);
+    return;
+  }
+
+  if (tipo === "obterNegocios") {
+    // Já inscrito lá em cima: o rendimento apurado, o ativo que o mestre
+    // contratou ou o nível que subiu chegam sozinhos na tela.
+    enviarNegocios(user, actor, true);
     return;
   }
 
@@ -670,6 +746,22 @@ async function tratarMensagem(mensagem, senderUserId) {
         });
         break;
       }
+      case "renderNegocio": {
+        await negocios.renderNegocio(actor, user, {
+          negocioId: mensagem.negocioId,
+          pericia: mensagem.pericia ?? null,
+          d20: mensagem.d20 ?? null
+        });
+        break;
+      }
+      case "movimentarCofre": {
+        await negocios.movimentarCofre(actor, user, {
+          negocioId: mensagem.negocioId,
+          operacao: mensagem.operacao,
+          quantia: mensagem.quantia
+        });
+        break;
+      }
       default:
         warn(`Mensagem com tipo desconhecido ignorada: "${tipo}"`);
     }
@@ -688,6 +780,10 @@ export function registrarRelay() {
 
   Hooks.on("updateActor", (actor, changes) => {
     marcarAtor(actor);
+    // O negócio em si (cofre, nível, ativos) e o personagem dono dele (o
+    // bônus de Nobreza e de Ofício). `marcarNegocios` não faz nada se ninguém
+    // estiver com a tela aberta, e a lista igual à última não sai.
+    if (negocios.ehNegocio(actor) || actor?.type === "character") marcarNegocios();
     if (actor?.type === "character" && mudancaAfetaListas(changes)) marcarListas();
   });
 
@@ -697,6 +793,8 @@ export function registrarRelay() {
     Hooks.on(evento, (item) => {
       marcarAtor(item?.parent);
       if (item?.parent?.type === "character" && item.type === "classe") marcarListas();
+      // Item e efeito mexem no bônus de Nobreza/Ofício que a tela de negócios mostra.
+      if (item?.parent?.type === "character") marcarNegocios();
     });
   }
 
@@ -711,11 +809,21 @@ export function registrarRelay() {
   // o core apagar o efeito nesses casos (`CONFIG.ActiveEffect.expiryAction`),
   // e é o `deleteActiveEffect` que leva a ficha nova pro celular.
   for (const evento of ["createActiveEffect", "updateActiveEffect", "deleteActiveEffect"]) {
-    Hooks.on(evento, (efeito) => marcarAtor(atorDoEfeito(efeito)));
+    Hooks.on(evento, (efeito) => {
+      const ator = atorDoEfeito(efeito);
+      marcarAtor(ator);
+      if (ator?.type === "character") marcarNegocios();
+    });
   }
 
-  Hooks.on("createActor", () => marcarListas());
-  Hooks.on("deleteActor", () => marcarListas());
+  Hooks.on("createActor", (actor) => {
+    marcarListas();
+    if (negocios.ehNegocio(actor)) marcarNegocios();
+  });
+  Hooks.on("deleteActor", (actor) => {
+    marcarListas();
+    if (negocios.ehNegocio(actor)) marcarNegocios();
+  });
 
   // ---- Combate ---------------------------------------------------------------
   // Tudo que mexe no encontro: começar, passar o turno, entrar na ordem,
